@@ -135,6 +135,15 @@ def apply(h):
     if rc != 0:
         rb = f"\nrollback: pct rollback {h['vmid']} {snap[0]}" if snap else ""
         raise RuntimeError(f"apt failed (rc {rc}):\n{tail}{rb}")
+    # npm + pip (best-effort: a failing package manager must never undo the apt result)
+    npm_msg = pip_msg = ""
+    _rc, _ = run(h, "for d in $(find /srv /opt /var/www -maxdepth 3 -name package.json 2>/dev/null | "
+                    "xargs -r -n1 dirname | sort -u); do cd \"$d\" && npm update --no-audit --no-fund >/dev/null 2>&1; done",
+                 timeout=900)
+    npm_msg = "npm updated" if _rc == 0 else "npm skipped (none, or error)"
+    _rc2, _ = run(h, "pip3 list --outdated --format=freeze 2>/dev/null | cut -d= -f1 | "
+                     "xargs -r -n1 pip3 install --upgrade 2>&1 >/dev/null", timeout=900)
+    pip_msg = "pip updated" if _rc2 == 0 else "pip skipped (none, or error)"
     need = "__REBOOT_REQUIRED__" in out
     hypervisor = h.get("hypervisor") is True
     if need and hypervisor:
@@ -145,7 +154,7 @@ def apply(h):
     else:
         reboot = "not needed"
     rb = f"\nrollback: pct rollback {h['vmid']} {snap[0]} on {snap[1]}" if snap else ""
-    return f"patched {h['ssh']}. reboot: {reboot}.{rb}"
+    return f"patched {h['ssh']}. reboot: {reboot}. {npm_msg}; {pip_msg}.{rb}"
 
 
 def main():
