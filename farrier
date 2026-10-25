@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""warden-patch — owner-approved patching as a standalone CLI.
+"""farrier — owner-approved patching as a standalone CLI.
 
 Detect-only by default: it never changes anything until you approve. `plan` shows a dry-run; `apply` (or `--yes`)
 then snapshots, upgrades, and reports before/after plus the rollback command. It fixes what the scanners find —
@@ -11,10 +11,10 @@ Hard rules (same as warden's patcher):
   - One job at a time per target.
   - A snapshot is taken first wherever possible, and the rollback command is always in the report.
 
-  patch plan <host>          dry-run: what would change (apt + npm + pip + docker)
-  patch apply <host> [--yes] snapshot then apply, report before/after + rollback
+  farrier plan <host>          dry-run: what would change (apt + npm + pip + docker)
+  farrier apply <host> [--yes] snapshot then apply, report before/after + rollback
 
-Config: patch.conf (YAML) or environment. A "host" is an ssh target; optional vmid + node give it
+Config: farrier.conf (YAML) or environment. A "host" is an ssh target; optional vmid + node give it
 Proxmox snapshot/rollback.
 """
 import argparse
@@ -42,9 +42,9 @@ def shq(s):
 
 
 def load_host(host):
-    """A host entry from patch.conf, or a bare ssh string."""
+    """A host entry from farrier.conf, or a bare ssh string."""
     conf = {}
-    for p in ("patch.conf", os.path.expanduser("~/.config/warden-patch.conf")):
+    for p in ("farrier.conf", os.path.expanduser("~/.config/farrier.conf")):
         if os.path.exists(p):
             try:
                 import yaml  # optional; a plain ssh string works without it
@@ -119,8 +119,8 @@ def snapshot(h):
     if not h.get("vmid"):
         return None
     node = h.get("node") or h["ssh"]
-    snap = "warden-patch-" + time.strftime("%Y%m%d%H%M")
-    rc, out = ssh(node, f"pct snapshot {h['vmid']} {snap} --description 'warden-patch'", timeout=600)
+    snap = "farrier-" + time.strftime("%Y%m%d%H%M")
+    rc, out = ssh(node, f"pct snapshot {h['vmid']} {snap} --description 'farrier'", timeout=600)
     if rc != 0:
         raise RuntimeError(f"snapshot failed, NOT patching: {out.strip()[-200:]}")
     return snap, node
@@ -149,7 +149,7 @@ def apply(h):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="warden-patch — owner-approved patching (detect-only until you approve)")
+    ap = argparse.ArgumentParser(description="farrier — owner-approved patching (detect-only until you approve)")
     ap.add_argument("cmd", choices=["plan", "apply"])
     ap.add_argument("host")
     ap.add_argument("--yes", action="store_true")
