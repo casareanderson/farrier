@@ -1,0 +1,10 @@
+# Copy to patch.conf and edit. Documentation IPs only (192.0.2.0/24).
+hosts:
+  myserver:
+    ssh: root@192.0.2.10
+    sudo: false
+    hypervisor: false
+  mycontainer:
+    ssh: root@192.0.2.11
+    vmid: "101"
+    node: pve@192.0.2.1

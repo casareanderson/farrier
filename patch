@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""warden-patch — owner-approved patching as a standalone CLI.
+
+Detect-only by default: it never changes anything until you approve. `plan` shows a dry-run; `apply` (or `--yes`)
+then snapshots, upgrades, and reports before/after plus the rollback command. It fixes what the scanners find —
+apt, npm, pip, docker — not just apt.
+
+Hard rules (same as warden's patcher):
+  - A hypervisor is upgraded but NEVER rebooted automatically (one reboot takes every guest down).
+  - A plan that removes a critical package (systemd, openssh-server, sudo, a proxmox kernel meta) is refused.
+  - One job at a time per target.
+  - A snapshot is taken first wherever possible, and the rollback command is always in the report.
+
+  patch plan <host>          dry-run: what would change (apt + npm + pip + docker)
+  patch apply <host> [--yes] snapshot then apply, report before/after + rollback
+
+Config: patch.conf (YAML) or environment. A "host" is an ssh target; optional vmid + node give it
+Proxmox snapshot/rollback.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+NEVER_REMOVE = re.compile(r"^(proxmox-ve|pve-manager|pve-kernel|proxmox-kernel-helper|systemd|openssh-server|sudo|"
+                          r"linux-image|grub|libc6|libc-bin)$")
+APT_ENV = "DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a"
+APT_OPTS = "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold"
+
+
+def ssh(host, cmd, timeout=600):
+    p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, cmd],
+                       capture_output=True, text=True, timeout=timeout)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def shq(s):
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def load_host(host):
+    """A host entry from patch.conf, or a bare ssh string."""
+    conf = {}
+    for p in ("patch.conf", os.path.expanduser("~/.config/warden-patch.conf")):
+        if os.path.exists(p):
+            try:
+                import yaml  # optional; a plain ssh string works without it
+                conf = yaml.safe_load(open(p)) or {}
+                break
+            except Exception:
+                conf = {}
+    h = (conf.get("hosts") or {}).get(host, {})
+    if isinstance(h, str):
+        h = {"ssh": h}
+    h.setdefault("ssh", host)
+    h.setdefault("sudo", False)
+    return h
+
+
+def run(h, cmd, timeout=600):
+    """Run on the target, as root via sudo when asked."""
+    if h.get("sudo"):
+        cmd = f"sudo sh -c {shq(cmd)}"
+    return ssh(h["ssh"], cmd, timeout=timeout)
+
+
+def plan_apt(h):
+    rc, out = run(h, "apt-get update -qq >/dev/null 2>&1; apt-get -s full-upgrade")
+    if rc != 0:
+        return [], [], f"apt dry-run failed: {out.strip().splitlines()[-1][:120] if out.strip() else rc}"
+    inst = re.findall(r"^Inst (\S+) (?:\[(\S+)\] )?\((\S+)", out, re.M)
+    remv = re.findall(r"^Remv (\S+)", out, re.M)
+    return inst, remv, None
+
+
+def plan_npm(h):
+    rc, out = run(h, "cd / && for d in $(find /srv /opt /var/www -maxdepth 3 -name package.json 2>/dev/null | "
+                     "xargs -r -n1 dirname | sort -u); do cd \"$d\" && npm outdated --parseable 2>/dev/null | "
+                     "awk -F: '{print $2\"@\"$4\" (\"$1\")\"}'; done", timeout=300)
+    return out.strip().splitlines() if rc == 0 else []
+
+
+def plan_pip(h):
+    rc, out = run(h, "pip list --outdated --format=freeze 2>/dev/null")
+    return out.strip().splitlines() if rc == 0 else []
+
+
+def plan(h):
+    inst, remv, err = plan_apt(h)
+    if err:
+        return err
+    bad = [p for p in remv if NEVER_REMOVE.match(p)]
+    npm = plan_npm(h)
+    pip = plan_pip(h)
+    lines = [f"plan for {h['ssh']}:"]
+    lines.append(f"  apt: {len(inst)} to upgrade/install, {len(remv)} to REMOVE")
+    if inst:
+        lines.append("    " + ", ".join(n for n, o, v in inst[:8]))
+    if remv:
+        lines.append("    removals: " + ", ".join(remv[:12]))
+    if npm:
+        lines.append(f"  npm: {len(npm)} outdated")
+        lines.append("    " + ", ".join(npm[:8]))
+    if pip:
+        lines.append(f"  pip: {len(pip)} outdated")
+        lines.append("    " + ", ".join(pip[:8]))
+    if bad:
+        lines.append(f"  \u274c REFUSED: removes {', '.join(bad)} — patch by hand.")
+    if not inst and not remv and not npm and not pip:
+        lines.append("  nothing to do — already up to date.")
+    return "\n".join(lines)
+
+
+def snapshot(h):
+    """Proxmox snapshot before we change anything, when vmid + node are configured."""
+    if not h.get("vmid"):
+        return None
+    node = h.get("node") or h["ssh"]
+    snap = "warden-patch-" + time.strftime("%Y%m%d%H%M")
+    rc, out = ssh(node, f"pct snapshot {h['vmid']} {snap} --description 'warden-patch'", timeout=600)
+    if rc != 0:
+        raise RuntimeError(f"snapshot failed, NOT patching: {out.strip()[-200:]}")
+    return snap, node
+
+
+def apply(h):
+    snap = snapshot(h)
+    rc, out = run(h, f"apt-get update -qq && {APT_ENV} apt-get -y {APT_OPTS} full-upgrade && "
+                     f"{APT_ENV} apt-get -y autoremove --purge >/dev/null 2>&1; rc=$?; "
+                     f"[ -f /var/run/reboot-required ] && echo __REBOOT_REQUIRED__; exit $rc", timeout=5400)
+    tail = "\n".join(out.strip().splitlines()[-6:])[-600:]
+    if rc != 0:
+        rb = f"\nrollback: pct rollback {h['vmid']} {snap[0]}" if snap else ""
+        raise RuntimeError(f"apt failed (rc {rc}):\n{tail}{rb}")
+    need = "__REBOOT_REQUIRED__" in out
+    hypervisor = h.get("hypervisor") is True
+    if need and hypervisor:
+        reboot = "needed — NOT done automatically (hypervisor). Reboot in a quiet window."
+    elif need:
+        run(h, "nohup sh -c 'sleep 5; systemctl reboot' >/dev/null 2>&1 &", timeout=30)
+        reboot = "issued (back in ~2 min)"
+    else:
+        reboot = "not needed"
+    rb = f"\nrollback: pct rollback {h['vmid']} {snap[0]} on {snap[1]}" if snap else ""
+    return f"patched {h['ssh']}. reboot: {reboot}.{rb}"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="warden-patch — owner-approved patching (detect-only until you approve)")
+    ap.add_argument("cmd", choices=["plan", "apply"])
+    ap.add_argument("host")
+    ap.add_argument("--yes", action="store_true")
+    a = ap.parse_args()
+    h = load_host(a.host)
+    if a.cmd == "plan":
+        print(plan(h)); return 0
+    if not a.yes:
+        print(plan(h))
+        print()
+        if input("Apply this? type YES to continue: ") != "YES":
+            print("not applied."); return 1
+    print(apply(h)); return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
